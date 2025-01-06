@@ -261,7 +261,7 @@ void RvizViewer::odometry_new_frame(const EstimationFrame::ConstPtr& new_frame) 
 void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& submaps) {
   const SubMap::ConstPtr latest_submap = submaps.back();
 
-  const double stamp_endpoint_R = latest_submap->odom_frames.back()->stamp;
+  const double stamp_endpoint_R = latest_submap->origin_odom_frames.back()->stamp;
   const Eigen::Isometry3d T_world_endpoint_R = latest_submap->T_world_origin * latest_submap->T_origin_endpoint_R;
   {
     std::lock_guard<std::mutex> lock(trajectory_mutex);
@@ -275,7 +275,7 @@ void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& sub
 
   // Invoke a submap concatenation task in the RvizViewer thread
   invoke([this, latest_submap, submap_poses] {
-    this->submaps.push_back(latest_submap->frame);
+    this->submaps.push_back(latest_submap->merged_keyframe);
 
     if (!map_pub->get_subscription_count()) {
       return;

@@ -240,11 +240,11 @@ size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstShared
   time_keeper->process(raw_points);
   auto preprocessed = preprocessor->preprocess(raw_points);
 
-  //if (keep_raw_points) {
+  if (keep_raw_points) {
     // note: Raw points are used only in extension modules for visualization purposes.
     //       If you need to reduce the memory footprint, you can safely comment out the following line.
     preprocessed->raw_points = raw_points;
-  //}
+  }
 
   odometry_estimation->insert_frame(preprocessed);
 
@@ -292,6 +292,8 @@ void GlimROS::timer_callback() {
 void GlimROS::wait(bool auto_quit) {
   spdlog::info("waiting for odometry estimation");
   odometry_estimation->join();
+
+  spdlog::info("odometry estimation terminated....");
 
   if (sub_mapping) {
     std::vector<glim::EstimationFrame::ConstPtr> estimation_results;
