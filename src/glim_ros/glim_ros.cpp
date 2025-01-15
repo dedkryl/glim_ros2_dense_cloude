@@ -68,6 +68,7 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
   glim::GlobalConfig::instance(config_path);
   glim::Config config_ros(glim::GlobalConfig::get_config_path("config_ros"));
 
+
   keep_raw_points = config_ros.param<bool>("glim_ros", "keep_raw_points", false);
   imu_time_offset = config_ros.param<double>("glim_ros", "imu_time_offset", 0.0);
   points_time_offset = config_ros.param<double>("glim_ros", "points_time_offset", 0.0);
@@ -119,6 +120,17 @@ GlimROS::GlimROS(const rclcpp::NodeOptions& options) : Node("glim_ros", options)
       }
     }
   }
+
+///////////////////
+  bool reconstruct = false;
+  this->declare_parameter<bool>("reconstruct", reconstruct);
+  this->get_parameter<bool>("reconstruct", reconstruct);
+  if(reconstruct)
+  {
+     spdlog::warn("Reconstruction mode begin");
+     return;
+  }
+///////////////////  
 
   // Extention modules
   const auto extensions = config_ros.param<std::vector<std::string>>("glim_ros", "extension_modules");

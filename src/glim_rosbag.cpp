@@ -40,6 +40,16 @@
 
 #include <glim/util/raw_points.hpp>
 
+////////////////////////////
+//Save to LAS PDAL library headers
+#include <pdal/PointView.hpp>
+#include <pdal/PointTable.hpp>
+#include <pdal/Dimension.hpp>
+#include <pdal/Options.hpp>
+#include <pdal/StageFactory.hpp>
+#include <io/BufferReader.hpp>
+////////////////////////////
+#include <glim/common/cloud_covariance_estimation.hpp>
 ///////////
 
 
@@ -80,19 +90,53 @@ void print_points(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
   sensor_msgs::PointCloud2Iterator<float> iter_x(*msg, "x");
   sensor_msgs::PointCloud2Iterator<float> iter_y(*msg, "y");
   sensor_msgs::PointCloud2Iterator<float> iter_z(*msg, "z");
-  static std::size_t counter, empty_counter;
+  sensor_msgs::PointCloud2Iterator<float> iter_intensity(*msg, "intensity");
+  static std::size_t msg_num;
+  std::size_t counter = 0, empty_coords_counter = 0,
+              intens_counter_10 = 0, intens_counter_30 = 0,
+              intens_counter_50 = 0, intens_counter_good = 0;
 
   for(size_t i = 0; i < msg->height * msg->width; ++i, ++iter_x, ++iter_y, ++iter_z) {
-    std::cout << "coords: " << *iter_x << ", " << *iter_y << ", " << *iter_z << '\n';
-    //spdlog::info("EG: coords x = {}, y = {}, z= {}", *iter_x , *iter_y , *iter_z);
+    //std::cout << "coords: " << *iter_x << ", " << *iter_y << ", " << *iter_z << '\n';
     counter++;
     if(*iter_x == 0.0 && *iter_y == 0.0 && *iter_z == 0.0)
     {
-      empty_counter++;
+      empty_coords_counter++;
+    }
+
+    if(*iter_intensity < 10.0)
+    {
+      intens_counter_10++;
+    }
+
+    if((*iter_intensity > 10.0) && (*iter_intensity < 30.0))
+    {
+      intens_counter_30++;
+    }
+
+
+    if((*iter_intensity > 30.0) && (*iter_intensity < 50.0))
+    {
+      intens_counter_50++;
+    }
+
+    if((*iter_intensity > 50.0))
+    {
+      intens_counter_good++;
     }
   }
-  std::cout << "counter = " << counter << ", " << " empty_counter = " << empty_counter << '\n';
-  //spdlog::info("EG: counter = {}, empty_counter = {}", counter, empty_counter);
+
+  msg_num++;
+  std::cout << "msg_num = " << msg_num 
+  << " time = " << msg->header.stamp.sec << "." << msg->header.stamp.nanosec
+  << ", " << " counter = " << counter
+  << ", " << " empty_coords_counter = " << empty_coords_counter
+  << ", " << " intens_counter_10 = " << intens_counter_10 
+  << ", " << " intens_counter_30 = " << intens_counter_30 
+  << ", " << " intens_counter_50 = " << intens_counter_50 
+  << ", " << " intens_counter_good = " << intens_counter_good 
+  << '\n';
+  
 }
 
 std::ostream& operator << (std::ostream& os, const Eigen::Isometry3d& rhs)                                                                                  //for struct output
@@ -240,21 +284,93 @@ public:
 std::random_device rd;  // a seed source for the random number engine
 std::mt19937 gen(rd()); // mersenne_twister_engine seeded with rd()
 
+//сквозная структура - заполняется по ходу 
+ struct PointEigen
+  {
+    PointEigen(){
+      time = 0.0, point_coord = Eigen::Vector4d{0,0,0,1}, intensity = 0.0, point_normal = Eigen::Vector4d{0,0,0,1};
+    }
+    double time;
+    Eigen::Vector4d point_coord;
+    double intensity;
+    Eigen::Vector4d point_normal;
+  };
+
+  //DEBUG
+  void save_coords_to_ply(const std::vector<PointEigen>& pev, const std::string file_name)
+  {
+    std::vector<Eigen::Vector4d> coords_vect;
+    for (auto &&p : pev)
+    {
+      coords_vect.push_back(p.point_coord);
+    }
+    glk::save_ply_binary("/tmp/" + file_name, coords_vect.data(), coords_vect.size());
+    std::cout  << "saved in " << "/tmp/" + file_name << std::endl;
+  }
+  //DEBUG
+
+  std::vector<Eigen::Vector4d> get_coords(const std::vector<PointEigen>& pev)
+  {
+    std::vector<Eigen::Vector4d> coords_vect;
+    for (auto &&p : pev)
+    {
+      coords_vect.push_back(p.point_coord);
+    }
+    return coords_vect;
+  }
+
 class Reconstructor
 {
   public:
+    //config params
+    double par_distance_near_thresh;
+    double par_distance_far_thresh;
+    bool par_use_random_grid_downsampling;
+    double par_downsample_resolution;
+    double par_downsample_target;
+    double par_downsample_rate;
+    double par_enable_outlier_removal;
+    int par_outlier_removal_k;
+    double par_outlier_std_mul_factor;
+    int par_k_correspondences;//used as k_neighbors in condense_neighbors()
+    int par_num_threads;
+    double par_max_sq_dist;
+    double par_deviation;
+    std::string par_dump_dir;
+    std::string par_output_file_path;
+
     bool init()
     {
-      if(!fillIntervalTrajMap("/tmp/dump/traj_lidar.txt"))
-        return false;
+      //config params init
+      glim::Config config(glim::GlobalConfig::get_config_path("config_reconstruct"));
+      par_distance_near_thresh = config.param<double>("config_reconstruct", "distance_near_thresh", 1.0);
+      par_distance_far_thresh = config.param<double>("config_reconstruct", "distance_far_thresh", 100.0);
+      par_use_random_grid_downsampling = config.param<bool>("config_reconstruct", "use_random_grid_downsampling", false);
+      par_downsample_resolution = config.param<double>("config_reconstruct", "downsample_resolution", 0.15);
+      par_downsample_target = config.param<double>("config_reconstruct", "random_downsample_target", 0);
+      par_downsample_rate = config.param<double>("config_reconstruct", "random_downsample_rate", 0.3);
+      par_enable_outlier_removal = config.param<bool>("config_reconstruct", "enable_outlier_removal", false);
+      par_outlier_removal_k = config.param<int>("config_reconstruct", "outlier_removal_k", 10);
+      par_outlier_std_mul_factor = config.param<double>("config_reconstruct", "outlier_std_mul_factor", 2.0);
+      par_k_correspondences = config.param<int>("config_reconstruct", "k_correspondences", 8);
+      par_num_threads = config.param<int>("config_reconstruct", "num_threads", 2);
+      par_max_sq_dist = config.param<double>("config_reconstruct", "max_sq_dist", 1.0);
+      par_deviation = config.param<double>("config_reconstruct", "deviation", 0.1);
+      par_dump_dir = config.param<std::string>("config_reconstruct", "dump_dir", "/tmp/dump/");//NB: Not config but CLI param in GLIM
+      par_output_file_path = config.param<std::string>("config_reconstruct", "output_file_path", "/tmp/reconstructed.ply");;
 
-      if(!fill_keyframes_data("/tmp/dump"))
+      if(!fillIntervalTrajMap(par_dump_dir + std::string{"traj_lidar.txt"}))
+      {
+        return false;
+      }
+
+      if(!fill_keyframes_data(par_dump_dir))
         return false;
 
       return true;  
     }
 
-    void do_reconstruct()
+    bool do_reconstruct()
     {
       //preprocessing
       std::vector<gtsam_points::PointCloud::Ptr> preprocessed_vect;
@@ -276,28 +392,67 @@ class Reconstructor
         }
       }
 
-      //temporary below - prepare to only points save
-      std::vector<Eigen::Vector4d> preprocessed_input_only_points;//!!!
+     
+      std::vector<PointEigen> input_points;//!!!
       for (auto &&frame : preprocessed_vect)
       {
         for(int i = 0;i<frame->size();i++)
         {
-          auto p = *(frame->points + i);
-          preprocessed_input_only_points.push_back(p);
+            PointEigen pe;
+            if(!frame->has_points())
+            {
+               spdlog::warn("Err : the point cloud has not points");
+               return false;
+            }
+            pe.point_coord = *(frame->points + i);
+
+            if(!frame->has_intensities())
+            {
+               spdlog::warn("Err : the point cloud has not intesities");
+               return false;
+            }
+            pe.intensity = *(frame->intensities + i);
+
+            if(!frame->has_times())
+            {
+               spdlog::warn("Err : the point cloud has not per-point timestamps");
+               return false;
+            }
+            pe.time = *(frame->times + i);
+
+            input_points.push_back(pe);
         }
       }
 
-      const double max_sq_dist = 1;//squared!!!
-      const double deviation = 0.01;//linear on coord
-      std::vector<Eigen::Vector4d> summary_condensed_points;
-      condense_neighbors(key_frame_points,
-                     preprocessed_input_only_points,
+      spdlog::warn("Reconstruction preparing. Please wait...");
+      
+      const double max_sq_dist = par_max_sq_dist;//1;//squared!!!
+      const double deviation = par_deviation;//0.01;//linear on coord
+      std::vector<PointEigen> summary_condensed_points;
+      if(!condense_points(key_frame_coords,
+                     input_points,
                      summary_condensed_points,
-                     max_sq_dist, deviation);
+                     max_sq_dist, deviation))
+      {
+        spdlog::error("Condense points error");
+        return false;
+      }                     
 
-  
-      glk::save_ply_binary("/tmp/reconstructed.ply", summary_condensed_points.data(), summary_condensed_points.size());
-      std::cout  << "saved in /tmp/reconstructed.ply" << std::endl;
+      //DEBUG
+      auto summary_condensed_coords = get_coords(summary_condensed_points);
+      glk::save_ply_binary(par_output_file_path, summary_condensed_coords.data(), summary_condensed_coords.size());
+      spdlog::warn("PLY : Reconstruction saved in {}", par_output_file_path);
+      /////////////////
+      const std::string las_file_name = "/tmp/summary.las";//TODO param in config
+      if(!save_las(las_file_name, summary_condensed_points))
+      {
+        spdlog::error("Save to LAS error!");
+        return false;
+      }
+
+      spdlog::warn("LAS : Reconstruction saved in {}", las_file_name);
+
+      return true;    
     }
 
 //...................................................................
@@ -373,19 +528,9 @@ class Reconstructor
       return m;
     }
 
-    std::vector<Eigen::Vector4d> key_frame_points;
-
-    // TODO : simplify it!
-    void convert()
-    {
-       for (auto &&sd : kd.sds)
-       {
-          for (auto &&p : sd.submap_points)
-          {
-            key_frame_points.push_back(p);
-          }
-       }
-    }
+    //std::vector<Eigen::Vector4d> key_frame_coords;
+    //std::map<double,Eigen::Vector4d> key_frame_coords;
+    std::vector<std::pair<double,Eigen::Vector4d>> key_frame_coords;
 
     bool fill_keyframes_data(const std::string& dump_dir_path)
     {
@@ -472,8 +617,21 @@ class Reconstructor
         }
         kd.sds.push_back(sd);
       }
-      assert(num_all_frames == kd.num_all_frames);
-      convert();//TODO : simpify it 
+      
+      //NB: num_all_frames == kd.num_all_frames
+      std::cout << " num_all_frames = " << num_all_frames <<  " kd.num_all_frames = " << kd.num_all_frames << std::endl;
+      
+      for (auto &&sd : kd.sds)
+      {
+          //NB: sd.timestamps.size() != sd.submap_points.size()
+          std::cout << " sd.timestamps.size() = "<< sd.timestamps.size() << " : sd.submap_points.size() = "<<  sd.submap_points.size() << std::endl;
+          //for (auto &&p : sd.submap_points)
+          for(size_t k = 0;k<sd.submap_points.size();k++)
+          {
+            //key_frame_coords.push_back(p);
+            key_frame_coords.push_back({sd.timestamps.at(0/* !!!! */),sd.submap_points.at(k)});
+          }
+      } 
       return true;
     }//fill_keyframes_data
 
@@ -660,29 +818,31 @@ class Reconstructor
       //Downsampling
       //.........................................................................
 
-      //use_random_grid_downsampling
-      auto random_downsample_target = 10000;//5000;//: Target number of points for voxel-based random sampling (Enabled when > 0)
-      //when random_downsample_target is down then output size is down
-      auto random_downsample_rate = 0.1;// Sampling rate for voxel-based random sampling (Enabled when target <= 0)
-      //when random_downsample_rate is changed then output size is not changed
-      const double rate = random_downsample_target > 0 ? static_cast<double>(random_downsample_target) / frame->size() : random_downsample_rate;
-      auto num_threads = 2;
-      auto downsample_resolution = 1.0;//0.25;// Voxel grid resolution for downsampling
-      //std::cout << " randomgrid_sampling input size = " << frame->size() << std::endl;
-      frame = gtsam_points::randomgrid_sampling(frame, downsample_resolution, rate, mt, num_threads);
-      //std::cout << " randomgrid_sampling output size = " << frame->size() << std::endl;
-      
+      if(par_use_random_grid_downsampling)
+      {
+        auto random_downsample_target = par_downsample_target;//10000;//5000;//: Target number of points for voxel-based random sampling (Enabled when > 0)
+        //when random_downsample_target is down then output size is down
+        auto random_downsample_rate = par_downsample_rate;//0.1;// Sampling rate for voxel-based random sampling (Enabled when target <= 0)
+        //when random_downsample_rate is changed then output size is not changed
+        const double rate = random_downsample_target > 0 ? static_cast<double>(random_downsample_target) / frame->size() : random_downsample_rate;
+        auto num_threads = par_num_threads;//2;
+        auto downsample_resolution = par_downsample_resolution;//1.0;//0.25;// Voxel grid resolution for downsampling
+        //std::cout << " randomgrid_sampling input size = " << frame->size() << std::endl;
+        frame = gtsam_points::randomgrid_sampling(frame, downsample_resolution, rate, mt, num_threads);
+        //std::cout << " randomgrid_sampling output size = " << frame->size() << std::endl;
+      }
+      else
+      {
       //.........................................................................
-      /*
-      auto num_threads = 2;
-      auto downsample_resolution = 1.0;// Voxel grid resolution for downsampling
-      frame = gtsam_points::voxelgrid_sampling(frame, downsample_resolution, num_threads);
-      */
+        auto num_threads = par_num_threads;//2;
+        auto downsample_resolution = par_downsample_resolution;//1.0;// Voxel grid resolution for downsampling
+        frame = gtsam_points::voxelgrid_sampling(frame, downsample_resolution, num_threads);
+      }
       //.........................................................................
     ///////////////////////////////////////////////////////////////////////////////////////////////////
       //Distance filter
-      auto distance_near_thresh = 0.5;//0.25;
-      auto distance_far_thresh = 100;
+      auto distance_near_thresh = par_distance_near_thresh;//0.5;//0.25;
+      auto distance_far_thresh = par_distance_far_thresh;//100;
       std::vector<int> indices;
       indices.reserve(frame->size());
       for (int i = 0; i < frame->size(); i++) {
@@ -699,12 +859,12 @@ class Reconstructor
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////
         // Outlier removal
-        auto enable_outlier_removal = true;
+        auto enable_outlier_removal = par_enable_outlier_removal;
         if (enable_outlier_removal) {
-          auto outlier_removal_k = 10;
-          auto outlier_std_mul_factor = 1.0;
+          auto outlier_removal_k = par_outlier_removal_k;//10;
+          auto outlier_std_mul_factor = par_outlier_std_mul_factor;//1.0;
           //num_threads
-          frame = gtsam_points::remove_outliers(frame, outlier_removal_k, outlier_std_mul_factor, num_threads);
+          frame = gtsam_points::remove_outliers(frame, outlier_removal_k, outlier_std_mul_factor, par_num_threads);
         }
     ////////////////////////////////////////////////////////////////
    
@@ -725,6 +885,7 @@ class Reconstructor
       return (distrib(gen)/1000.0f);
     }
 
+    //not used
     void condense_neighbors(const std::vector<Eigen::Vector4d>& key_frame_points,
                               std::vector<Eigen::Vector4d>& input_points,
                               std::vector<Eigen::Vector4d>& summary_condensed_points,
@@ -733,7 +894,7 @@ class Reconstructor
     {
       std::unordered_set<Eigen::Vector4d> neighbors_set;
       std::shared_ptr<gtsam_points::KdTree> target_tree(new gtsam_points::KdTree(input_points.data(), input_points.size()));
-      int k_neighbors = 8;
+      int k_neighbors = par_k_correspondences;//8;
       std::vector<size_t> k_indices(k_neighbors);
       std::vector<double> k_sq_dists(k_neighbors);
       size_t nn;
@@ -772,6 +933,115 @@ class Reconstructor
       //add keyframes
       summary_condensed_points.insert(summary_condensed_points.end(),  key_frame_points.begin(), key_frame_points.end());   
     }//condense_neighbors
+
+
+
+
+    bool condense_points(const std::vector<std::pair<double,Eigen::Vector4d>>& key_frame_coords /*const std::vector<Eigen::Vector4d>& key_frame_coords*/,
+                              std::vector<PointEigen>& input_points,
+                              std::vector<PointEigen>& summary_condensed_points,
+                              const double max_sq_dist,
+                              const double deviation)
+    {
+      if(key_frame_coords.empty() || input_points.empty())
+      {
+        spdlog::error("Sth going wrong - no input or keyframes data");
+        return false;
+      }
+      //1) Ищем среди input_points соседние с key_frame_coords - то есть находящиеся не далее max_sq_dist от них,
+      // но в кол-ве не более k_neighbors  
+      //std::unordered_set<Eigen::Vector4d> neighbors_set;
+      std::unordered_map<Eigen::Vector4d, PointEigen> neighbors_map;//indexed by coords
+      auto input_coords = get_coords(input_points);
+      std::shared_ptr<gtsam_points::KdTree> target_tree(new gtsam_points::KdTree(input_coords.data(), input_coords.size()));
+      int k_neighbors = par_k_correspondences;//8;
+      std::vector<size_t> k_indices(k_neighbors);
+      std::vector<double> k_sq_dists(k_neighbors);
+      size_t nn;
+
+      std::vector<PointEigen> key_frame_points;
+      key_frame_points.reserve(key_frame_coords.size());
+
+      //std::cout << " max_sq_dist : "<< max_sq_dist << std::endl;
+      //static double last_time;
+      int alone_kf_points_counter = 0;
+      
+      spdlog::warn("condense_points key_frame_coords size = {}", key_frame_coords.size());
+
+      //for (size_t k = 0; k < key_frame_coords.size(); k++)
+      for (auto &&kf : key_frame_coords)
+      {
+          size_t nn = target_tree->knn_search(
+                                  //gtsam_points::frame::point(key_frame_coords, k).data(),
+                                  
+                                  kf.second.data(),
+                                  k_neighbors,
+                                    k_indices.data(),
+                                    k_sq_dists.data(),
+                                    max_sq_dist
+                                  );
+          bool has_neighbor = false;
+          for (size_t i = 0; i < k_neighbors; i++)
+          {
+            if(k_indices[i]!=std::numeric_limits<size_t>::max())
+            {
+                has_neighbor = true;//has at least one neighbor
+                //input_points.at(k_indices[i]).point_coord.x() = generate_random_coord(key_frame_coords[k].x(), deviation);
+                //input_points.at(k_indices[i]).point_coord.y() = generate_random_coord(key_frame_coords[k].y(), deviation);
+                //input_points.at(k_indices[i]).point_coord.z() = generate_random_coord(key_frame_coords[k].z(), deviation);
+                //std::cout << i << " - "<< k_indices[i] << std::endl;
+                neighbors_map.insert({input_points.at(k_indices[i]).point_coord, input_points.at(k_indices[i])});
+            }
+          }
+
+          //2) Достраиваем key_frame_point на основе key_frame_coord и инфы в соседях
+          PointEigen key_frame_point;
+          /*key_frame_point.point_coord = key_frame_coords[k];*/
+          key_frame_point.point_coord = kf.second;
+          if(has_neighbor)
+          {
+            //std::cout << " : "<< k_indices[0] << std::endl;
+            key_frame_point.intensity = input_points.at(k_indices[0]).intensity;
+            key_frame_point.time = input_points.at(k_indices[0]).time;
+            //last_time = input_points.at(k_indices[0]).time;//???
+          }
+          else
+          {
+            //spdlog::warn("Sth going wrong - no neighbors for keyframe");//It's not impossible !!!! Why ?
+            //std::cout << key_frame_point.point_coord << std::endl;
+            //std::cout << std::fixed << std::setprecision(6) << "last_time : " << last_time << std::endl;
+            key_frame_point.intensity = 15;//? Or ignore this point ? which % of alone kf points ? which are her coords?
+            //key_frame_point.time = last_time;//?
+            key_frame_point.time = kf.first;//очень приблизительно - на основе первого(!) stamp в data.txt в submap
+            alone_kf_points_counter++;
+          }
+
+          key_frame_points.push_back(key_frame_point);
+
+      }
+
+      spdlog::warn("alone_kf_points_counter = {}",alone_kf_points_counter);
+      spdlog::warn("condensed {} neighbors", neighbors_map.size());
+        
+      //3) move from hash map to summary_condensed_points vector
+      summary_condensed_points.resize(neighbors_map.size());
+      size_t l = 0;
+      for (auto &&ns : neighbors_map)
+      {
+          summary_condensed_points[l++] = std::move(ns.second);
+      }
+      
+      //4) add keyframes points to summary
+      summary_condensed_points.insert(summary_condensed_points.end(),  key_frame_points.begin(), key_frame_points.end());
+
+      //5) calcul and fill normals fields in points
+      //TODO : k param can have diff values for kf neighbors and normals calculation
+     return calculate_normals(summary_condensed_points, par_k_correspondences);
+
+         
+    }//condense_points
+
+
 //...................................................................
 
   std::vector<std::shared_ptr<glim::RawPoints>> raw_points_vector;
@@ -786,6 +1056,234 @@ class Reconstructor
     raw_points_vector.push_back(raw_points);
     return true;
   }
+
+// las saving below
+  bool fillView(pdal::PointViewPtr view, const std::vector<PointEigen>& points)
+  {
+    
+    try
+    {
+      for (size_t l = 0; l< points.size();l ++)
+      {
+        if(points.at(l).time == 0.0) { spdlog::error("Reconstructor::fillView error: time == 0.0 "); return false; }
+        view->setField(pdal::Dimension::Id::GpsTime, l , points.at(l).time);
+        //if(points.at(l).point_coord.x() == 0.0) { spdlog::error("Reconstructor::fillView error: point_coord.x() == 0.0 "); return false; }
+        view->setField(pdal::Dimension::Id::X, l , points.at(l).point_coord.x());
+        //if(points.at(l).point_coord.y() == 0.0) { spdlog::error("Reconstructor::fillView error: point_coord.y() == 0.0 "); return false; }
+        view->setField(pdal::Dimension::Id::Y, l , points.at(l).point_coord.y());
+        //if(points.at(l).point_coord.z() == 0.0) { spdlog::error("Reconstructor::fillView error: point_coord.z() == 0.0 "); return false; }
+        view->setField(pdal::Dimension::Id::Z, l , points.at(l).point_coord.z());
+        //if(points.at(l).intensity == 0.0) { spdlog::error("Reconstructor::fillView error: intensity == 0.0 "); return false; }
+        view->setField(pdal::Dimension::Id::Intensity, l , points.at(l).intensity);
+        //if(points.at(l).point_normal.x() == 0.0) { spdlog::error("Reconstructor::fillView error: point_normal.x() == 0.0 "); return false; }
+        view->setField(pdal::Dimension::Id::NormalX, l , points.at(l).point_normal.x());
+        //if(points.at(l).point_normal.y() == 0.0) { spdlog::error("Reconstructor::fillView error: point_normal.y() == 0.0 "); return false; }
+        view->setField(pdal::Dimension::Id::NormalY, l , points.at(l).point_normal.y());
+        //if(points.at(l).point_normal.z() == 0.0) { spdlog::error("Reconstructor::fillView error: point_normal.z() == 0.0 "); return false; }
+        view->setField(pdal::Dimension::Id::NormalZ, l , points.at(l).point_normal.z());
+      }
+  
+    }
+    catch(const std::exception& e)
+    {
+      spdlog::error("Reconstructor::fillView error: {}",e.what());
+      return false;
+    }
+    spdlog::info("Reconstructor::fillView points count = {}", points.size());
+    return true;
+  }
+
+  bool save_las(const std::string& las_file_name, const std::vector<PointEigen>& points)
+  {
+  /*
+  в LAS должны быть все данные
+  XYZ, нормали (они же угол излучения), GPS-время, интенсивность
+  */
+  /*
+  PDAL:
+  In addition to the X, Y, Z coordinates of a point, PDAL can write many other attributes. Their full
+  list and types are in [Dimension.json]. Most of these are not enabled by default. To enable them, the
+  LAS file format minor version should be set to 4, the value of the `extra_dims` writer option should be `all`,
+  and the attributes should be registered with the function ``registerDim()``.
+
+  */
+
+    //////////////////////////////////////////////////////////////////////
+    spdlog::info("Reconstructor  saves to LAS");
+    using namespace pdal;
+    Options options;
+    options.add("filename", las_file_name);
+    options.add("extra_dims", "all");
+    options.add("minor_version", 4);
+
+    PointTable table;
+    table.layout()->registerDim(Dimension::Id::GpsTime);
+    table.layout()->registerDim(Dimension::Id::X);
+    table.layout()->registerDim(Dimension::Id::Y);
+    table.layout()->registerDim(Dimension::Id::Z);
+    table.layout()->registerDim(Dimension::Id::Intensity);
+    table.layout()->registerDim(Dimension::Id::NormalX);
+    table.layout()->registerDim(Dimension::Id::NormalY);
+    table.layout()->registerDim(Dimension::Id::NormalZ);
+
+    spdlog::info(std::string("Writing to file : ") + las_file_name);
+    PointViewPtr view(new PointView(table));
+    if(!view)
+    {
+      spdlog::error("Unable to const PointView");
+      return false;
+    }
+
+    if(!fillView(view, points))
+      return false;
+
+    BufferReader reader;
+    reader.addView(view);
+
+    StageFactory factory;
+
+    // StageFactory always "owns" stages it creates. They'll be destroyed with the factory.
+    Stage *writer = factory.createStage("writers.las");
+    if(!writer)
+    {
+          std::cout << "Unable to create writer..." << std::endl;
+          return false;
+    }
+
+    writer->setInput(reader);
+    writer->setOptions(options);
+    writer->prepare(table);
+    writer->execute(table);
+  ////////////////////////////////////////////////////////////////////////  
+    return true;
+  }
+//las saving above
+
+
+// normals calculation below
+std::vector<int> find_neighbors(const Eigen::Vector4d* points, const int num_points, const int k)  {
+  gtsam_points::KdTree tree(points, num_points);
+
+  std::vector<int> neighbors(num_points * k);
+
+  const auto perpoint_task = [&](int i) {
+    std::vector<size_t> k_indices(k);
+    std::vector<double> k_sq_dists(k);
+    tree.knn_search(points[i].data(), k, k_indices.data(), k_sq_dists.data());
+    std::copy(k_indices.begin(), k_indices.end(), neighbors.begin() + i * k);
+  };
+
+  int num_threads = 2;//temp
+  
+  if (gtsam_points::is_omp_default()) {
+#pragma omp parallel for num_threads(num_threads) schedule(guided, 8)
+    for (int i = 0; i < num_points; i++) {
+      perpoint_task(i);
+    }
+  } else {
+#ifdef GTSAM_POINTS_USE_TBB
+    tbb::parallel_for(tbb::blocked_range<int>(0, num_points, 8), [&](const tbb::blocked_range<int>& range) {
+      for (int i = range.begin(); i < range.end(); i++) {
+        perpoint_task(i);
+      }
+    });
+#else
+    std::cerr << "error : TBB is not enabled" << std::endl;
+    abort();
+#endif
+  }
+
+  return neighbors;
+}
+
+bool calculate_normals(std::vector<PointEigen>& points, const int kn)
+{
+   std::vector<Eigen::Vector4d> normals;
+
+   const int num_points = points.size();
+   std::vector<Eigen::Vector4d> temp;
+
+   for (auto &&p : points)
+   {
+      temp.push_back(p.point_coord);    
+   }
+   
+   auto nn = find_neighbors(temp.data(), num_points, kn);
+   if(nn.size() != num_points*kn)
+   {
+      std::cout <<  "Err: points neighbors: nn.size() != num_points*kn" << std::endl;
+      return false;
+   }
+
+   //debug (print neighbors)
+   /*
+   for (auto np = 0;np < num_points;np++)
+   {
+      std::cout <<  np << " points neighbors: ";
+      for (auto k = 0; k < kn; k++)
+      {
+        std::cout << nn.at(np+k) << " ,";
+      }
+      std::cout << std::endl;  
+   }
+   */
+   
+   //std::vector<Eigen::Vector4d> normals;
+   std::vector<Eigen::Matrix4d> covs;//not used
+   std::unique_ptr<glim::CloudCovarianceEstimation> covariance_estimation;
+   covariance_estimation.reset(new glim::CloudCovarianceEstimation(2));//num_threads
+   covariance_estimation->estimate(temp, nn, normals, covs);
+   
+   if((normals.size() != points.size()) ||
+        (covs.size() != points.size()))
+   {
+      std::cout <<  "Err: out arrs are not equals" << std::endl;
+      return false;
+   }
+
+    //direction ambiguaty resolving
+    /*
+    https://pcl.readthedocs.io/projects/tutorials/en/master/normal_estimation.html
+    The solution to this problem is trivial if the viewpoint  is in fact known. To orient all normals  consistently
+    towards the viewpoint, they need to satisfy the equation:
+    points.at(index).dot(normals.at(index))<0
+    */
+   size_t index = 0;
+  
+   //spdlog::warn("Nota Bene: NO  direction ambiguaty resolving usage");
+  
+   for(index =0;index < normals.size();index++)
+   {
+        //Why ALL dot products in AVIA are negative???
+        //std::cout << points.at(index).dot(normals.at(index)) << std::endl;
+        if(temp.at(index).dot(normals.at(index))>=0)
+        {
+          //flip normal' vector
+          normals.at(index).x() = normals.at(index).x() * (-1);
+          normals.at(index).y() = normals.at(index).y() * (-1);
+          normals.at(index).z() = normals.at(index).z() * (-1);
+        }
+
+        points.at(index).point_normal = normals.at(index);
+
+   }
+   
+   //debug (print normals)
+   /*
+   index = 0;
+   for(auto &&norm : normals)
+   {
+     std::cout <<  index++ << " point normal: ";
+     //std::cout <<  norm << std::endl;
+     std::cout << std::fixed << std::setprecision(6) << "x : " <<  norm.x() << " \t y : " <<  norm.y() << " \t z : " <<  norm.z() << std::endl;
+   }
+   */
+ 
+  return true;
+}
+//normal calculation above
+
+
 
 };//Reconstructor
 
@@ -880,13 +1378,17 @@ int main(int argc, char** argv) {
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////
   bool reconstruct = false;
-  glim->declare_parameter<bool>("reconstruct", reconstruct);
+  //Declared in GlimROS ctor
+  //glim->declare_parameter<bool>("reconstruct", reconstruct);
   glim->get_parameter<bool>("reconstruct", reconstruct);
   Reconstructor rc;
   if(reconstruct)
   {
     if(!rc.init())
+    {
+      spdlog::error("Reconstructor initialization error!");
       return false;
+    }
   }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -938,7 +1440,8 @@ int main(int argc, char** argv) {
       if (bag_t0 == 0) {
         bag_t0 = msg_time;
       }
-      spdlog::debug("msg_time: {} ({} sec)", msg_time / 1e9, (msg_time - bag_t0) / 1e9);
+      
+      //spdlog::debug("msg_time: {} ({} sec)", msg_time / 1e9, (msg_time - bag_t0) / 1e9);
 
       if (start_offset > 0.0 && msg_time - bag_t0 < start_offset * 1e9) {
         spdlog::debug("skipping msg for start_offset ({} < {})", (msg_time - bag_t0) / 1e9, start_offset);
@@ -961,16 +1464,28 @@ int main(int argc, char** argv) {
       }
 
       if (msg->topic_name == imu_topic) {
-        auto imu_msg = std::make_shared<sensor_msgs::msg::Imu>();
-        imu_serialization.deserialize_message(&serialized_msg, imu_msg.get());
-        glim->imu_callback(imu_msg);
+        if(!reconstruct)
+        {
+          auto imu_msg = std::make_shared<sensor_msgs::msg::Imu>();
+          imu_serialization.deserialize_message(&serialized_msg, imu_msg.get());
+          glim->imu_callback(imu_msg);
+        }
+        else//debug
+        {
+           //auto imu_msg = std::make_shared<sensor_msgs::msg::Imu>();
+           //imu_serialization.deserialize_message(&serialized_msg, imu_msg.get());
+           //spdlog::trace("IMU: {}.{}", imu_msg->header.stamp.sec, imu_msg->header.stamp.nanosec);
+        }
+
       } else if (msg->topic_name == points_topic) {
         auto points_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
         points_serialization.deserialize_message(&serialized_msg, points_msg.get());
 ///////////////////////////////////////
         if(reconstruct)
         {
-          rc.points_callback(points_msg);
+          //rc.points_callback(points_msg);
+          print_points(points_msg);
+          //spdlog::trace("POINTS: {}.{}", points_msg->header.stamp.sec, points_msg->header.stamp.nanosec);
         }
 //////////////////////////////////////        
         else
@@ -988,16 +1503,22 @@ int main(int argc, char** argv) {
           }
         }
       } else if (msg->topic_name == image_topic && topic_type == "sensor_msgs/msg/Image") {
-        auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
-        image_serialization.deserialize_message(&serialized_msg, image_msg.get());
-        glim->image_callback(image_msg);
+        if(!reconstruct)
+        {
+          auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
+          image_serialization.deserialize_message(&serialized_msg, image_msg.get());
+          glim->image_callback(image_msg);
+        }
       } else if (msg->topic_name == image_topic && topic_type == "sensor_msgs/msg/CompressedImage") {
-        auto compressed_image_msg = std::make_shared<sensor_msgs::msg::CompressedImage>();
-        compressed_image_serialization.deserialize_message(&serialized_msg, compressed_image_msg.get());
+        if(!reconstruct)
+        {
+          auto compressed_image_msg = std::make_shared<sensor_msgs::msg::CompressedImage>();
+          compressed_image_serialization.deserialize_message(&serialized_msg, compressed_image_msg.get());
 
-        auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
-        cv_bridge::toCvCopy(*compressed_image_msg, "bgr8")->toImageMsg(*image_msg);
-        glim->image_callback(image_msg);
+          auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
+          cv_bridge::toCvCopy(*compressed_image_msg, "bgr8")->toImageMsg(*image_msg);
+          glim->image_callback(image_msg);
+        }
       }
 
       auto found = subscription_map.find(msg->topic_name);
